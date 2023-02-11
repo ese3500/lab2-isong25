@@ -74,15 +74,20 @@ ISR(TIMER1_OVF_vect) {
     ovfCount++;
 }
 
+char complete = '-'; // placeholder
+
+void printChar(void) {
+    if (complete != '-') {
+        sprintf(String, "%c\n", tree[current]);
+        UART_putstring(String);
+        complete = '-';
+    }
+}
+
 ISR(TIMER1_CAPT_vect) {
     if (PINB & (1<<PINB0)) { // caught rising edge
         rise = ICR1; // record timer value of rising edge
         lowTime = (float)(rise - fall) * 1000 / CLK_FREQ + ovfCount * 1000; // how long button not pressed (ms)
-        if (lowTime >= 1000 && fall >= 0) {
-            sprintf(String, "%c\n", tree[current]);
-            UART_putstring(String);
-            current = 0;
-        }
         TIFR1 |= (1<<ICF1); // clear interrupt flag
         TCCR1B &= ~(1<<ICES1); // detect falling edge
     } else { // caught falling edge
@@ -111,5 +116,12 @@ int main(void)
     UART_init(BAUD_PRESCALER);
     sprintf(String, "%s\n", "\n\n\n\n\n");
     UART_putstring(String);
-    while (1) {}
+    while (1) {
+        while (PINB & (1<<PINB0)); // wait while input is high
+        if ((float)(TCNT1 - fall) * 1000 / CLK_FREQ + ovfCount * 1000 > 1000) {
+            complete = tree[current];
+            printChar();
+            current = 0;
+        }
+    }
 }
