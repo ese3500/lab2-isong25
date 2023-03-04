@@ -1,127 +1,173 @@
+#include <avr/delay.h>
 #include <avr/io.h>
 #include <stdio.h>
 #include <avr/interrupt.h>
-#include "uart.h"
-#include <util/delay.h>
 
-#define F_CPU 16000000UL
-#define BAUD_RATE 9600
-#define BAUD_PRESCALER (((F_CPU / (BAUD_RATE * 16UL))) - 1)
+/*
+ * PD6 (pin 6) = trigger
+ * PD5 (pin 5) = buzzer
+ * PD4 (pin 4) = button
+ * ICP1 (pin 8) = echo
+ * PA0 = photoresistor
+ */
 
-// - is just root, # are placeholders, ! is out of bounds
-const char tree[] = {'-', 'E', 'T', 'I', 'A', 'N', 'M', 'S', 'U', 'R', 'W',
-                    'D', 'K', 'G', 'O', 'H', 'V', 'F', '#', 'L',
-                    '#', 'P', 'J', 'B', 'X', 'C', 'Y', 'Z', 'Q',
-                    '#', '#', '5', '4', '#', '3', '#', '#',
-                    '#', '2', '#', '#', '#', '#', '#', '#',
-                    '#', '1', '6', '#', '#', '#', '#', '#', '#',
-                    '#', '7', '#', '#', '#', '8', '#', '9', '0',
-                    '!'};
-
-#define CLK_FREQ 62500UL
-unsigned int rise = 0;
-unsigned int fall = -1;
+// timer 1 clock frequency is 2000000 (prescaler of 8)
+int echoStart = 0;
+int echoEnd = 0;
 int ovfCount = 0;
-float lowTime = 0.0;
-float highTime = 0.0;
-int current = 0; // where in character tree, start at root
+double cm = 0.0;
 
-char String[25];
-
-int addDot(int i) { // left child is dot
-    if (2 * (i + 1) <= 61) {
-        return 2 * i + 1;
-    }
-    return 62; // '!' in tree = out of bounds
-}
-
-int addDash(int i) { // right child is dash
-    if (2 * (i + 1) + 1 <= 61) {
-        return 2 * (i + 1);
-    }
-    return 62; // '!' in tree = out of bounds
-}
-
-void Initialize() {
+void InitializeSensor() {
     cli();
 
-    DDRB &= ~(1<<DDB0); // (ICP1) input pin
-    DDRB |= (1<<DDB2); // dot LED
-    DDRB |= (1<<DDB3); // dash LED
+    DDRB &= ~(1<<DDB0); // configure input capture pin ICP1
+    DDRD |= (1<<DDD6); // configure output pin D6
+    PORTD &= ~(1<<PORTD6);
 
-    // TOTAL PRESCALING: divide by 256 --> frequency = 62.5 kHz
-    // prescale timer clock by factor of 256
-    TCCR1B |= (1<<CS12);
-    TCCR1B &= ~(1<<CS11);
-    TCCR1B &= ~(1<<CS10);
-
-    // normal mode
+    // timer 1 to normal mode
     TCCR1A &= ~(1<<WGM10);
     TCCR1A &= ~(1<<WGM11);
     TCCR1B &= ~(1<<WGM12);
     TCCR1B &= ~(1<<WGM13);
 
+    // prescale timer clock by factor of 8
+    TCCR1B &= ~(1<<CS12);
+    TCCR1B |= (1<<CS11);
+    TCCR1B &= ~(1<<CS10);
+
     TIMSK1 |= (1<<TOIE1); // enable timer overflow interrupt
+
+    TIMSK1 |= (1<<ICIE1); // enable input capture
     TCCR1B |= (1<<ICES1); // detect rising edge
-    TIFR1 |= (1<<ICF1); // clear input capture flag
-    TIMSK1 |= (1<<ICIE1); // enable interrupt capture
+    TIFR1 |= (1<<ICF1); // clear interrupt flag
+
+    sei();
+}
+
+void InitializePhotoresistor() {
+    cli();
+
+    PRR &= ~(1<<PRADC); // turn on ADC
+
+    // prescale ADC timer by 128
+    ADCSRA |= (1<<ADPS0);
+    ADCSRA |= (1<<ADPS1);
+    ADCSRA |= (1<<ADPS2);
+
+    // AVcc as reference
+    ADMUX |= (1<<REFS0);
+    ADMUX &= ~(1<<REFS1);
+
+    // input at ADC0
+    ADMUX &= ~(1<<MUX3);
+    ADMUX &= ~(1<<MUX2);
+    ADMUX &= ~(1<<MUX1);
+    ADMUX &= ~(1<<MUX0);
+
+    // free running mode
+    ADCSRB &= ~(1<<ADTS0);
+    ADCSRB &= ~(1<<ADTS1);
+    ADCSRB &= ~(1<<ADTS2);
+
+    DIDR0 |= (1<<ADC0D); // digital input disable for ADC0 pin
+
+    ADCSRA |= (1<<ADATE); // auto trigger enable
+    ADCSRA |= (1<<ADEN); // ADC enable
+    ADCSRA |= (1<<ADSC); // ADC start conversion
+
+    sei();
+}
+
+void InitializeBuzzer() {
+    cli();
+
+    DDRD |= (1<<DDD5); // output on PD5 (OC0B) for buzzer
+    DDRD &= ~(1<<DDD4); // input on PD4 for mode button
+
+    // timer 0 to phase correct PWM mode
+    TCCR0A |= (1<<WGM00);
+    TCCR0A &= ~(1<<WGM01);
+    TCCR0B |= (1<<WGM02);
+
+    // prescale timer by 64
+    TCCR0B &= ~(1<<CS02);
+    TCCR0B |= (1<<CS01);
+    TCCR0B |= (1<<CS00);
+
+    OCR0A = 71;
+    OCR0B = OCR0A * 0.5; // default about 50% duty cycle
+
+    // clear when up counting, set when down counting
+    TCCR0A |= (1<<COM0B1);
+    TCCR0A &= ~(1<<COM0B0);
 
     sei();
 }
 
 ISR(TIMER1_OVF_vect) {
-    // flag cleared automatically
-    ovfCount++;
-}
-
-char complete = '-'; // placeholder
-
-void printChar(void) {
-    if (complete != '-') {
-        sprintf(String, "%c\n", tree[current]);
-        UART_putstring(String);
-        complete = '-';
+    if (PINB & (1<<PINB0)) {
+        ovfCount++;
     }
 }
 
 ISR(TIMER1_CAPT_vect) {
-    if (PINB & (1<<PINB0)) { // caught rising edge
-        rise = ICR1; // record timer value of rising edge
-        lowTime = (float)(rise - fall) * 1000 / CLK_FREQ + ovfCount * 1000; // how long button not pressed (ms)
-        TIFR1 |= (1<<ICF1); // clear interrupt flag
+    if (PINB & (1<<PINB0)) { // rising edge detected
+        echoStart = ICR1;
+        ovfCount = 0;
         TCCR1B &= ~(1<<ICES1); // detect falling edge
-    } else { // caught falling edge
-        fall = ICR1; // record timer value of falling edge
-        highTime = (float)(fall - rise) * 1000 / CLK_FREQ + ovfCount * 1000; // how long button pressed (ms)
-        if (highTime >= 500) {
-            current = addDash(current);
-            PORTB |= (1<<PORTB3);
-            _delay_ms(50);
-            PORTB &= ~(1<<PORTB3);
-        } else if (highTime < 500) {
-            current = addDot(current);
-            PORTB |= (1<<PORTB2);
-            _delay_ms(50);
-            PORTB &= ~(1<<PORTB2);
-        }
-        TIFR1 |= (1<<ICF1); // clear interrupt flag
+    } else { // falling edge detected
+        echoEnd = ICR1;
+        // 2 ticks per us, 0.0343 cm/us, extra division by 2 per datasheet
+        cm = ((double)(echoEnd - echoStart) + ovfCount * 65536) / 116.618;
+        ovfCount = 0;
         TCCR1B |= (1<<ICES1); // detect rising edge
     }
-    ovfCount = 0;
 }
 
-int main(void)
-{
-    Initialize();
-    UART_init(BAUD_PRESCALER);
-    sprintf(String, "%s\n", "\n\n\n\n\n");
-    UART_putstring(String);
-    while (1) {
-        while (PINB & (1<<PINB0)); // wait while input is high
-        if ((float)(TCNT1 - fall) * 1000 / CLK_FREQ + ovfCount * 1000 > 1000) {
-            complete = tree[current];
-            printChar();
-            current = 0;
+int getOCR0A[8] = {59, 62, 70, 79, 89, 94, 106, 119};
+
+int setOC(void) {
+    int calc;
+    int adc = ADC;
+    // tone (frequency)
+    if (PIND & (1<<PIND4)) { // button pressed = continuous mode
+        // continuous distance range from about 3-63cm
+        calc = (int)cm + 59;
+        if (calc > 119) {
+            OCR0A = 119;
+        } else {
+            OCR0A = calc;
         }
+    } else { // button not pressed = discrete mode
+        // 8 discrete ranges in increments of 9cm from the sensor
+        calc = (int)(cm / 9);
+        if (calc >= 8) {
+            OCR0A = 119;
+        } else {
+            OCR0A = getOCR0A[calc];
+        }
+    }
+    // volume control (duty cycle)
+    if (adc >= 1000) {
+        OCR0B = OCR0A * 0.5; // max duty cycle of about 50%
+    } else {
+        OCR0B = OCR0A * ((double)(adc) / 2000.0); // continuous scale duty cycle
+    }
+}
+
+int main(void) {
+    InitializeSensor();
+    InitializePhotoresistor();
+    InitializeBuzzer();
+    while (1) {
+        while (!(TCCR1B & (1<<ICES1))); // wait till set to detect rising edge (wait till edge falls)
+        setOC();
+        _delay_ms(50);
+
+        PORTD |= (1<<PORTD6);
+        _delay_us(10);
+        PORTD &= ~(1<<PORTD6);
+
+        while ((TCCR1B & (1<<ICES1))); // wait till set to detect falling edge (wait till edge rises)
     }
 }
